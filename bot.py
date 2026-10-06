@@ -1,33 +1,33 @@
 import os
-import sqlite3
+import json
 import logging
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+DATA_FILE = "data.json"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- ИНИЦИАЛИЗА БАЗЫ ДАННЫХ ---
-def init_db():
-    conn = sqlite3.connect('salary.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            date TEXT,
-            revenue REAL,
-            salary REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# --- РАБОТА С ХРАНИЛИЩЕМ (JSON) ---
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка чтения файла: {e}")
+    return {}
 
-init_db()
+def save_data(data):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения файла: {e}")
 
-# --- ФУНКЦИЯ РАСЧЕТА СТАВКИ ---
+# --- ШКАЛА СТАВОК (СЕТКА) ---
 def calculate_salary(revenue: float) -> int:
     if revenue < 40000:
         return 1300
@@ -51,134 +51,131 @@ def get_keyboard():
         resize_keyboard=True
     )
 
-# --- КОМАНДА /start ---
+# --- /START ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "👋 **Привет! Я бот для учета смен и зарплаты.**\n\n"
-        "🔹 **Как записать смену:**\n"
-        "• Просто отправь выручку за сегодня: `45000`\n"
-        "• Или укажи дату и сумму: `05.10 52000`\n\n"
-        "Используй кнопки ниже для просмотра статистики за месяц!"
+        "👋 **Бот учета зарплаты и смен**\n\n"
+        "🔹 **Как вводить данные:**\n"
+        "• Отправить сумму за сегодня: `45000`\n"
+        "• Отправить дату и сумму: `05.10 52000`\n\n"
+        "Используй кнопки ниже для просмотра итогов за месяц!"
     )
     await update.message.reply_markdown(msg, reply_markup=get_keyboard())
 
-# --- ПОЛУЧЕНИЕ СТАТИСТИКИ ЗА МЕСЯЦ ---
-def get_month_stats(user_id: int, month_str: str = None):
-    if not month_str:
-        month_str = datetime.now().strftime("%Y-%m")
-        
-    conn = sqlite3.connect('salary.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT COUNT(*), SUM(revenue), SUM(salary) 
-        FROM shifts 
-        WHERE user_id = ? AND date LIKE ?
-    ''', (user_id, f"{month_str}%"))
-    
-    count, total_revenue, total_salary = cursor.fetchone()
-    conn.close()
-    
-    return count or 0, total_revenue or 0.0, total_salary or 0.0
-
-# --- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ---
+# --- ОБРАБОТКА СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    raw_text = update.message.text.strip()
-    
-    # Режим просмотра статистики
-    if raw_text == "📊 Статистика за месяц":
-        count, total_rev, total_sal = get_month_stats(user_id)
+    user_id = str(update.message.from_user.id)
+    text = update.message.text.strip()
+    data = load_data()
+
+    if user_id not in data:
+        data[user_id] = []
+
+    # 📊 СТАТИСТИКА ЗА МЕСЯЦ
+    if text == "📊 Статистика за месяц":
         current_month = datetime.now().strftime("%m.%Y")
+        user_shifts = data.get(user_id, [])
         
+        month_shifts = [s for s in user_shifts if datetime.strptime(s["date"], "%Y-%m-%d").strftime("%m.%Y") == current_month]
+        
+        if not month_shifts:
+            await update.message.reply_markdown(f"📭 В этом месяце ({current_month}) смен еще нет.", reply_markup=get_keyboard())
+            return
+
+        total_rev = sum(s["revenue"] for s in month_shifts)
+        total_sal = sum(s["salary"] for s in month_shifts)
+        count = len(month_shifts)
+
         msg = (
             f"📅 *Статистика за {current_month}*\n\n"
             f"🚩 Всего смен: *{count}*\n"
-            f"💰 Общая выручка: *{total_rev:,.0f} грн*\n"
+            f"💰 Общая выручка/заказы: *{total_rev:,.0f} грн*\n"
             f"💵 *Итого заработано: {total_sal:,.0f} грн*"
         ).replace(',', ' ')
         
         await update.message.reply_markdown(msg, reply_markup=get_keyboard())
         return
 
-    # Режим просмотра истории
-    if raw_text == "📜 История смен":
-        conn = sqlite3.connect('salary.db')
-        cursor = conn.cursor()
-        current_month = datetime.now().strftime("%Y-%m")
-        cursor.execute('''
-            SELECT date, revenue, salary 
-            FROM shifts 
-            WHERE user_id = ? AND date LIKE ?
-            ORDER BY date DESC LIMIT 10
-        ''', (user_id, f"{current_month}%"))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        if not rows:
-            await update.message.reply_text("📭 В этом месяце пока нет записанных смен.")
+    # 📜 ИСТОРИЯ СМЕН
+    if text == "📜 История смен":
+        user_shifts = data.get(user_id, [])
+        if not user_shifts:
+            await update.message.reply_text("📭 История смен пуста.", reply_markup=get_keyboard())
             return
-            
-        history_msg = "📜 *Последние смены этого месяца:*\n\n"
-        for date_str, rev, sal in rows:
-            history_msg += f"🗓 `{date_str}`: Выручка *{rev:,.0f} грн* ➔ Зарплата: *{sal:,.0f} грн*\n".replace(',', ' ')
-            
-        await update.message.reply_markdown(history_msg, reply_markup=get_keyboard())
+
+        recent_shifts = sorted(user_shifts, key=lambda x: x["date"], reverse=True)[:10]
+        msg = "📜 *Последние записанные смены:*\n\n"
+        
+        for s in recent_shifts:
+            d = datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+            msg += f"🗓 `{d}`: Заказы *{s['revenue']:,.0f} грн* ➔ Зарплата: *{s['salary']:,.0f} грн*\n".replace(',', ' ')
+
+        await update.message.reply_markdown(msg, reply_markup=get_keyboard())
         return
 
-    # Парсинг ввода смены (дата + сумма или просто сумма)
-    parts = raw_text.split()
+    # ВВОД СУММЫ / ДАТЫ
+    parts = text.split()
     date_str = datetime.now().strftime("%Y-%m-%d")
-    revenue_str = ""
+    rev_raw = ""
 
     if len(parts) == 1:
-        revenue_str = parts[0]
+        rev_raw = parts[0]
     elif len(parts) == 2:
-        # Введена дата и сумма (например: 05.10 45000)
-        date_input = parts[0]
-        revenue_str = parts[1]
+        date_input, rev_raw = parts[0], parts[1]
         try:
             day, month = date_input.split('.')
             year = datetime.now().year
             date_str = f"{year}-{int(month):02d}-{int(day):02d}"
         except Exception:
-            await update.message.reply_text("⚠️ Неверный формат даты. Используйте формат `ДД.ММ Сумма`, например: `05.10 45000`")
+            await update.message.reply_text("⚠️ Ошибка даты! Вводи в формате `ДД.ММ Сумма` (например: `05.10 45000`).")
             return
 
-    # Очищаем сумму
-    clean_revenue = "".join([c for c in revenue_str if c.isdigit() or c in ['.', ',']]).replace(',', '.')
+    clean_rev = "".join([c for c in rev_raw if c.isdigit() or c in ['.', ',']]).replace(',', '.')
     
     try:
-        revenue = float(clean_revenue)
+        revenue = float(clean_rev)
         if revenue < 0:
-            await update.message.reply_text("⚠️ Сумма должна быть положительной.")
+            await update.message.reply_text("⚠️ Сумма должна быть больше нуля.")
             return
-            
+
         salary = calculate_salary(revenue)
+
+        # Сохраняем или обновляем смену на эту дату
+        user_shifts = data[user_id]
+        updated = False
+        for s in user_shifts:
+            if s["date"] == date_str:
+                s["revenue"] = revenue
+                s["salary"] = salary
+                updated = True
+                break
+
+        if not updated:
+            user_shifts.append({"date": date_str, "revenue": revenue, "salary": salary})
+
+        save_data(data)
+
+        d_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
         
-        # Сохраняем смену в базу данных
-        conn = sqlite3.connect('salary.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO shifts (user_id, date, revenue, salary)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, date_str, revenue, salary))
-        conn.commit()
-        conn.close()
-        
-        # Получаем обновленную статистику за месяц
-        count, _, total_sal = get_month_stats(user_id, date_str[:7])
-        
+        # Считаем актуальный месяц
+        current_m = datetime.strptime(date_str, "%Y-%m-%d").strftime("%m.%Y")
+        m_shifts = [s for s in user_shifts if datetime.strptime(s["date"], "%Y-%m-%d").strftime("%m.%Y") == current_m]
+        total_m_sal = sum(s["salary"] for s in m_shifts)
+
         msg = (
-            f"✅ *Смена записана!* ({date_str})\n\n"
-            f"💰 Выручка за день: *{revenue:,.0f} грн*\n"
+            f"✅ *Смена за {d_formatted} записана!*\n\n"
+            f"💰 Выручка/Заказы: *{revenue:,.0f} грн*\n"
             f"💵 Зарплата за день: *{salary:,.0f} грн*\n\n"
-            f"📈 Всего за месяц ({count} смен): *{total_sal:,.0f} грн*"
+            f"📈 Заработано за месяц ({len(m_shifts)} смен): *{total_m_sal:,.0f} грн*"
         ).replace(',', ' ')
-        
+
         await update.message.reply_markdown(msg, reply_markup=get_keyboard())
-        
+
     except ValueError:
-        await update.message.reply_text("⚠️ Не удалось распознать сумму. Введите число (например `45000` или `05.10 45000`).")
+        await update.message.reply_text("⚠️ Не понял сумму. Введи просто число (например `45000`) или `05.10 45000`.")
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
