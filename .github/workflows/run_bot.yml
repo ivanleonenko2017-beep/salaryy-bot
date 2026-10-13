@@ -4,6 +4,8 @@ on:
   push:
     branches: [ "main", "master" ]
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *' # Автоматически перезапускает бота каждые 5 часов
 
 jobs:
   run-bot:
